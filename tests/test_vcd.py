@@ -10,7 +10,10 @@ from app.vcd import (
     MAX_VALUE_CHANGES,
     VCDError,
     Window,
+    audit,
     parse,
+    parse_edge,
+    parse_positive_fs,
     parse_signals,
     parse_window,
     process,
@@ -428,3 +431,266 @@ def test_no_partial_result_on_late_error():
     vcd_text = build_vcd("#0\n0!\n#5\n1!\n#10\n2!\n")
     with pytest.raises(VCDError):
         process(vcd_text, ["top.clk"], Window(0, 10_000_000))
+
+
+# --- timing audit ----------------------------------------------------------
+
+AUDIT_VCD = build_vcd(
+    "#0\n0!\n0\"\n"
+    "#10\n1!\n"
+    "#20\n0!\n"
+    "#26\n1\"\n"
+    "#30\n1!\n"
+    "#33\n0\"\n"
+    "#40\n0!\n"
+    "#50\n1!\n"
+    "#60\n0!\n"
+)
+
+
+def test_audit_happy_path():
+    result = audit(
+        AUDIT_VCD, "top.clk", ["top.data"],
+        Window(10_000_000, 50_000_000), "rising", 5_000_000, 5_000_000,
+    )
+    assert result["window"] == {"start": 10_000_000, "end": 50_000_000, "unit": "fs"}
+    assert result["clock"] == "top.clk"
+    assert result["edge"] == "rising"
+    assert result["setupFs"] == 5_000_000
+    assert result["holdFs"] == 5_000_000
+    # Rising edges at 10/30/50 ns; the half-open window keeps the first two.
+    assert [e["time"] for e in result["edges"]] == [10_000_000, 30_000_000]
+    first, second = result["edges"]
+    assert first["samples"] == {"top.data": "0"}
+    assert first["violations"] == []
+    assert first["unknown"] == []
+    assert second["samples"] == {"top.data": "1"}
+    assert second["violations"] == [
+        {"kind": "setup", "signal": "top.data",
+         "at": 26_000_000, "from": "0", "to": "1"},
+        {"kind": "hold", "signal": "top.data",
+         "at": 33_000_000, "from": "1", "to": "0"},
+    ]
+    assert second["unknown"] == []
+    assert result["summary"] == {
+        "edges": 2,
+        "setupViolations": 1,
+        "holdViolations": 1,
+        "unknown": 0,
+        "cleanEdges": 1,
+    }
+
+
+def test_audit_same_instant_transition_is_setup_and_hold():
+    vcd_text = build_vcd(
+        "#0\n0!\n0\"\n"
+        "#10\n1!\n1\"\n"
+        "#20\n0!\n0\"\n"
+        "#30\n1!\n"
+        "#40\n0!\n"
+    )
+    result = audit(
+        vcd_text, "top.clk", ["top.data"],
+        Window(5_000_000, 35_000_000), "rising", 2_000_000, 2_000_000,
+    )
+    assert [e["time"] for e in result["edges"]] == [10_000_000, 30_000_000]
+    first, second = result["edges"]
+    # Data toggles exactly at the edge: one transition, both violation kinds.
+    assert first["samples"] == {"top.data": "1"}
+    assert first["violations"] == [
+        {"kind": "setup", "signal": "top.data",
+         "at": 10_000_000, "from": "0", "to": "1"},
+        {"kind": "hold", "signal": "top.data",
+         "at": 10_000_000, "from": "0", "to": "1"},
+    ]
+    assert second["violations"] == []
+    assert result["summary"]["setupViolations"] == 1
+    assert result["summary"]["holdViolations"] == 1
+    assert result["summary"]["cleanEdges"] == 1
+
+
+def test_audit_falling_edge_polarity():
+    result = audit(
+        AUDIT_VCD, "top.clk", ["top.data"],
+        Window(10_000_000, 50_000_000), "falling", 5_000_000, 5_000_000,
+    )
+    assert [e["time"] for e in result["edges"]] == [20_000_000, 40_000_000]
+    assert all(e["violations"] == [] for e in result["edges"])
+    assert result["summary"]["cleanEdges"] == 2
+
+
+def test_audit_aperture_boundaries_are_half_open():
+    vcd_text = build_vcd(
+        "#0\n0!\n0\"\n"
+        "#8\n1\"\n"
+        "#10\n1!\n"
+        "#12\n0\"\n"
+        "#20\n0!\n"
+    )
+    result = audit(
+        vcd_text, "top.clk", ["top.data"],
+        Window(5_000_000, 15_000_000), "rising", 2_000_000, 2_000_000,
+    )
+    (edge,) = result["edges"]
+    assert edge["time"] == 10_000_000
+    # t' == t - setupFs and t' == t + holdFs are both outside the apertures.
+    assert edge["violations"] == []
+    assert edge["samples"] == {"top.data": "1"}
+
+
+def test_audit_x_in_aperture_marks_unknown():
+    vcd_text = build_vcd(
+        "#0\n0!\nx\"\n"
+        "#5\n0\"\n"
+        "#10\n1!\n"
+        "#20\n0!\n"
+    )
+    result = audit(
+        vcd_text, "top.clk", ["top.data"],
+        Window(7_000_000, 15_000_000), "rising", 7_000_000, 4_000_000,
+    )
+    (edge,) = result["edges"]
+    assert edge["time"] == 10_000_000
+    assert edge["unknown"] == ["top.data"]
+    # The x -> 0 transition at 5 ns still counts as a setup-aperture change.
+    assert edge["violations"] == [
+        {"kind": "setup", "signal": "top.data",
+         "at": 5_000_000, "from": "x", "to": "0"},
+    ]
+    assert edge["samples"] == {"top.data": "0"}
+    assert result["summary"]["unknown"] == 1
+
+
+def test_audit_multiple_signals_sorted_samples():
+    vcd_text = build_vcd(
+        "#0\n0!\n0\"\n0#\n"
+        "#10\n1!\n"
+        "#12\n1#\n"
+        "#20\n0!\n",
+        signals={"!": "clk", '"': "data", "#": "ctrl"},
+    )
+    result = audit(
+        vcd_text, "top.clk", ["top.ctrl", "top.data"],
+        Window(5_000_000, 15_000_000), "rising", 3_000_000, 5_000_000,
+    )
+    (edge,) = result["edges"]
+    assert list(edge["samples"].keys()) == ["top.ctrl", "top.data"]
+    assert edge["samples"] == {"top.ctrl": "0", "top.data": "0"}
+    assert edge["violations"] == [
+        {"kind": "hold", "signal": "top.ctrl",
+         "at": 12_000_000, "from": "0", "to": "1"},
+    ]
+
+
+def test_audit_cross_timescale_results_match():
+    ns = build_vcd(
+        "#0\n0!\n0\"\n#10\n1!\n#20\n0!\n#26\n1\"\n#30\n1!\n"
+        "#33\n0\"\n#40\n0!\n#50\n1!\n#60\n0!\n",
+        timescale="1ns",
+    )
+    ps = build_vcd(
+        "#0\n0!\n0\"\n#10000\n1!\n#20000\n0!\n#26000\n1\"\n#30000\n1!\n"
+        "#33000\n0\"\n#40000\n0!\n#50000\n1!\n#60000\n0!\n",
+        timescale="1ps",
+    )
+    window = Window(10_000_000, 50_000_000)
+    a = audit(ns, "top.clk", ["top.data"], window, "rising", 5_000_000, 5_000_000)
+    b = audit(ps, "top.clk", ["top.data"], window, "rising", 5_000_000, 5_000_000)
+    assert a == b
+
+
+def test_audit_non_binary_clock_rejected():
+    vcd_text = build_vcd(
+        "#0\n0!\n0\"\n"
+        "#5\nx!\n"
+        "#10\n1!\n"
+        "#20\n0!\n"
+    )
+    with pytest.raises(VCDError) as exc:
+        audit(vcd_text, "top.clk", ["top.data"],
+              Window(5_000_000, 15_000_000), "rising", 2_000_000, 2_000_000)
+    assert exc.value.code == "NON_BINARY_CLOCK"
+    assert exc.value.details["value"] == "x"
+    assert exc.value.details["signal"] == "top.clk"
+
+
+def test_audit_clock_x_outside_aperture_is_ignored():
+    vcd_text = build_vcd(
+        "#0\nx!\n0\"\n"
+        "#1\n0!\n"
+        "#10\n1!\n"
+        "#20\n0!\n"
+    )
+    result = audit(
+        vcd_text, "top.clk", ["top.data"],
+        Window(5_000_000, 15_000_000), "rising", 2_000_000, 2_000_000,
+    )
+    assert [e["time"] for e in result["edges"]] == [10_000_000]
+
+
+def test_audit_aperture_not_covered():
+    # Setup aperture reaches before the first timestamp.
+    with pytest.raises(VCDError) as exc:
+        audit(AUDIT_VCD, "top.clk", ["top.data"],
+              Window(10_000_000, 50_000_000), "rising", 20_000_000, 5_000_000)
+    assert exc.value.code == "APERTURE_NOT_COVERED"
+    assert exc.value.details["aperture_start_fs"] == -10_000_000
+    # Hold aperture reaches past the last timestamp.
+    with pytest.raises(VCDError) as exc2:
+        audit(AUDIT_VCD, "top.clk", ["top.data"],
+              Window(10_000_000, 50_000_000), "rising", 5_000_000, 20_000_000)
+    assert exc2.value.code == "APERTURE_NOT_COVERED"
+    assert exc2.value.details["aperture_end_fs"] == 70_000_000
+
+
+def test_audit_undeclared_clock_rejected():
+    with pytest.raises(VCDError) as exc:
+        audit(AUDIT_VCD, "top.nope", ["top.data"],
+              Window(10_000_000, 50_000_000), "rising", 5_000_000, 5_000_000)
+    assert exc.value.code == "UNDECLARED_SIGNAL"
+    assert "top.nope" in exc.value.details["signals"]
+
+
+def test_audit_no_edges_in_window():
+    result = audit(
+        AUDIT_VCD, "top.clk", ["top.data"],
+        Window(11_000_000, 19_000_000), "rising", 5_000_000, 5_000_000,
+    )
+    assert result["edges"] == []
+    assert result["summary"] == {
+        "edges": 0,
+        "setupViolations": 0,
+        "holdViolations": 0,
+        "unknown": 0,
+        "cleanEdges": 0,
+    }
+
+
+def test_parse_edge_normalization():
+    assert parse_edge("rising") == "rising"
+    assert parse_edge("PosEdge") == "rising"
+    assert parse_edge("0->1") == "rising"
+    assert parse_edge("falling") == "falling"
+    assert parse_edge("NEGEDGE") == "falling"
+    assert parse_edge("1->0") == "falling"
+    with pytest.raises(VCDError) as exc:
+        parse_edge("sideways")
+    assert exc.value.code == "INVALID_EDGE"
+    with pytest.raises(VCDError) as exc2:
+        parse_edge(None)
+    assert exc2.value.code == "MISSING_FIELD"
+
+
+def test_parse_positive_fs():
+    assert parse_positive_fs("1", "setupFs") == 1
+    assert parse_positive_fs("5000", "holdFs") == 5000
+    for bad in ["0", "-3", "1.5", "abc", ""]:
+        with pytest.raises(VCDError) as exc:
+            parse_positive_fs(bad, "setupFs")
+        assert exc.value.code == "INVALID_APERTURE", bad
+    with pytest.raises(VCDError) as exc:
+        parse_positive_fs(None, "holdFs")
+    assert exc.value.code == "MISSING_FIELD"
+    with pytest.raises(VCDError) as exc2:
+        parse_positive_fs(str(2**63), "setupFs")
+    assert exc2.value.code == "OUT_OF_RANGE"

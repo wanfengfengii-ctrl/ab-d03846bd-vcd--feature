@@ -647,3 +647,183 @@ def process(text: str, signals: list[str], window: Window) -> dict:
         "window": {"start": window.start, "end": window.end, "unit": "fs"},
         "signals": result_signals,
     }
+
+
+# --- timing audit ---------------------------------------------------------
+
+EDGE_ALIASES = {
+    "rising": "rising",
+    "rise": "rising",
+    "posedge": "rising",
+    "0->1": "rising",
+    "falling": "falling",
+    "fall": "falling",
+    "negedge": "falling",
+    "1->0": "falling",
+}
+
+
+def parse_edge(raw: Optional[str]) -> str:
+    """Normalize the edge selector to 'rising' or 'falling'."""
+    if raw is None:
+        raise bad_request("MISSING_FIELD", "form field 'edge' is required")
+    edge = EDGE_ALIASES.get(raw.strip().lower())
+    if edge is None:
+        raise bad_request(
+            "INVALID_EDGE",
+            "edge must be 'rising' or 'falling' "
+            "(aliases: posedge/negedge, 0->1/1->0)",
+            details={"edge": raw},
+        )
+    return edge
+
+
+def parse_positive_fs(raw: Optional[str], field: str) -> int:
+    """Parse a positive femtosecond aperture field (setupFs/holdFs)."""
+    if raw is None:
+        raise bad_request("MISSING_FIELD", f"form field {field!r} is required")
+    text = raw.strip()
+    if not INT_RE.match(text) or int(text) < 1:
+        raise bad_request(
+            "INVALID_APERTURE",
+            f"{field} must be a positive integer number of femtoseconds",
+            details={field: raw},
+        )
+    value = int(text)
+    if value > MAX_FS:
+        raise bad_request(
+            "OUT_OF_RANGE",
+            f"{field} must lie within [1, {MAX_FS}] femtoseconds",
+        )
+    return value
+
+
+def audit(
+    text: str,
+    clock: str,
+    signals: list[str],
+    window: Window,
+    edge: str,
+    setup_fs: int,
+    hold_fs: int,
+) -> dict:
+    """Check setup/hold margins of *signals* around *clock* edges.
+
+    Edges are the normalized clock transitions of the requested polarity
+    inside the half-open window. For an edge at t, a data transition at t'
+    is a setup violation when ``t - setup_fs < t' <= t`` and a hold
+    violation when ``t <= t' < t + hold_fs``; a transition exactly at t is
+    both. x/z anywhere in the aperture marks the signal as unknown.
+    All-or-nothing result.
+    """
+    vcd = parse(text)
+
+    missing = [s for s in dict.fromkeys([clock, *signals]) if s not in vcd.names]
+    if missing:
+        raise VCDError(
+            "UNDECLARED_SIGNAL",
+            "selected signal is not declared in the VCD",
+            details={"signals": missing},
+            http_status=400,
+        )
+
+    assert vcd.first_ts is not None and vcd.last_ts is not None
+    aperture_start = window.start - setup_fs
+    aperture_end = window.end + hold_fs
+    if aperture_start < vcd.first_ts or aperture_end > vcd.last_ts:
+        raise VCDError(
+            "APERTURE_NOT_COVERED",
+            "setup/hold apertures cannot be fully interpreted from the "
+            "waveform: the VCD must contain a timestamp at or before "
+            "window start minus setupFs and at or after window end plus "
+            "holdFs",
+            details={
+                "aperture_start_fs": aperture_start,
+                "aperture_end_fs": aperture_end,
+                "first_timestamp_fs": vcd.first_ts,
+                "last_timestamp_fs": vcd.last_ts,
+            },
+        )
+
+    clock_timeline = vcd.signal_timeline(clock, aperture_start, aperture_end)
+    for seg in clock_timeline:
+        if seg["value"] not in ("0", "1"):
+            raise VCDError(
+                "NON_BINARY_CLOCK",
+                "clock must be 0 or 1 throughout the window and its "
+                "setup/hold apertures",
+                details={
+                    "signal": clock,
+                    "value": seg["value"],
+                    "start_fs": seg["start"],
+                    "end_fs": seg["end"],
+                },
+            )
+
+    want_from, want_to = ("0", "1") if edge == "rising" else ("1", "0")
+    edge_times = [
+        nxt["start"]
+        for prev, nxt in zip(clock_timeline, clock_timeline[1:])
+        if prev["value"] == want_from
+        and nxt["value"] == want_to
+        and window.start <= nxt["start"] < window.end
+    ]
+
+    edges_out: list[dict] = []
+    total_setup = total_hold = total_unknown = clean_edges = 0
+    for edge_t in edge_times:
+        lo, hi = edge_t - setup_fs, edge_t + hold_fs
+        samples: dict[str, str] = {}
+        violations: list[dict] = []
+        unknown: list[str] = []
+        for name in sorted(signals):
+            timeline = vcd.signal_timeline(name, lo, hi)
+            for seg in timeline:
+                if seg["start"] <= edge_t < seg["end"]:
+                    samples[name] = seg["value"]
+                    break
+            if any(seg["value"] in ("x", "z") for seg in timeline):
+                unknown.append(name)
+            for prev, nxt in zip(timeline, timeline[1:]):
+                t_prime = nxt["start"]
+                entry = {
+                    "signal": name,
+                    "at": t_prime,
+                    "from": prev["value"],
+                    "to": nxt["value"],
+                }
+                # Interior boundaries satisfy lo < t' < hi, so these are
+                # exactly the half-open apertures; t' == t lands in both.
+                if t_prime <= edge_t:
+                    violations.append({"kind": "setup", **entry})
+                if t_prime >= edge_t:
+                    violations.append({"kind": "hold", **entry})
+        total_setup += sum(1 for v in violations if v["kind"] == "setup")
+        total_hold += sum(1 for v in violations if v["kind"] == "hold")
+        total_unknown += len(unknown)
+        if not violations and not unknown:
+            clean_edges += 1
+        edges_out.append(
+            {
+                "time": edge_t,
+                "samples": samples,
+                "violations": violations,
+                "unknown": unknown,
+            }
+        )
+
+    return {
+        "window": {"start": window.start, "end": window.end, "unit": "fs"},
+        "clock": clock,
+        "edge": edge,
+        "setupFs": setup_fs,
+        "holdFs": hold_fs,
+        "edges": edges_out,
+        "summary": {
+            "edges": len(edge_times),
+            "setupViolations": total_setup,
+            "holdViolations": total_hold,
+            "unknown": total_unknown,
+            "cleanEdges": clean_edges,
+        },
+    }
