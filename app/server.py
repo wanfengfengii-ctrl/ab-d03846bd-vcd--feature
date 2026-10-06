@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Optional
 
 from flask import Flask, jsonify, request
 
+from .timing import audit, parse_edge, parse_positive_fs
 from .vcd import (
     MAX_FILE_BYTES,
     VCDError,
@@ -50,7 +50,15 @@ def create_app() -> Flask:
             body, status = exc.to_response()
             return jsonify(body), status
 
-    def _handle_window() -> tuple:
+    @app.post("/api/vcd/timing-audit")
+    def vcd_timing_audit() -> tuple:
+        try:
+            return _handle_timing_audit()
+        except VCDError as exc:
+            body, status = exc.to_response()
+            return jsonify(body), status
+
+    def _read_upload_text() -> str:
         # Note: request.content_length includes the multipart envelope, so
         # the 4 MiB rule is enforced on the decoded file part below instead.
         if "file" not in request.files:
@@ -64,7 +72,7 @@ def create_app() -> Flask:
                 http_status=413,
             )
         try:
-            text = raw.decode("ascii")
+            return raw.decode("ascii")
         except UnicodeDecodeError as exc:
             raise bad_request(
                 "NOT_ASCII",
@@ -72,10 +80,34 @@ def create_app() -> Flask:
                 details={"byte_offset": exc.start},
             ) from exc
 
+    def _handle_window() -> tuple:
+        text = _read_upload_text()
         window = parse_window(_form_value("window"))
         signals = parse_signals(request.form.getlist("signals"))
 
         result = process(text, signals, window)
+        return jsonify(result), 200
+
+    def _handle_timing_audit() -> tuple:
+        text = _read_upload_text()
+        window = parse_window(_form_value("window"))
+        clock = _form_value("clock")
+        if clock is None:
+            raise bad_request("MISSING_FIELD", "form field 'clock' is required")
+        signals = parse_signals(request.form.getlist("signals"))
+        edge = parse_edge(_form_value("edge"))
+        setup_fs = parse_positive_fs("setupFs", _form_value("setupFs"))
+        hold_fs = parse_positive_fs("holdFs", _form_value("holdFs"))
+
+        result = audit(
+            text,
+            clock=clock,
+            signals=signals,
+            window=window,
+            edge=edge,
+            setup_fs=setup_fs,
+            hold_fs=hold_fs,
+        )
         return jsonify(result), 200
 
     def _form_value(key: str) -> Optional[str]:

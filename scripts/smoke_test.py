@@ -7,6 +7,9 @@ It exercises:
 * same-timestamp value changes arbitrated in text order
 * a cross-timescale window (1ns vs 1ps must give identical fs timelines)
 * a time-regression rejection with a locatable error (no partial result)
+* POST /api/vcd/timing-audit: a normal audit, a same-instant data
+  transition counting as both setup and hold, and a cross-timescale
+  audit (1ns vs 1ps must give identical results)
 
 Exits 0 only when every check passes.
 """
@@ -31,6 +34,14 @@ $upscope $end
 $enddefinitions $end
 """
 
+AUDIT_HEADER = """$timescale {ts} $end
+$scope module top $end
+$var wire 1 ! clk $end
+$var wire 1 " data $end
+$upscope $end
+$enddefinitions $end
+"""
+
 
 def post(body: str, signals, start: int, end: int) -> requests.Response:
     files = {"file": ("wave.vcd", io.BytesIO(body.encode("ascii")), "text/plain")}
@@ -40,6 +51,25 @@ def post(body: str, signals, start: int, end: int) -> requests.Response:
     }
     return requests.post(
         f"{BASE_URL}/api/vcd/window",
+        files=files,
+        data=data,
+        timeout=TIMEOUT,
+    )
+
+
+def post_audit(body: str, start: int, end: int, *, setup: int, hold: int,
+               edge: str = "rising") -> requests.Response:
+    files = {"file": ("wave.vcd", io.BytesIO(body.encode("ascii")), "text/plain")}
+    data = {
+        "window": json.dumps({"start": start, "end": end}),
+        "clock": "top.clk",
+        "signals": ["top.data"],
+        "edge": edge,
+        "setupFs": str(setup),
+        "holdFs": str(hold),
+    }
+    return requests.post(
+        f"{BASE_URL}/api/vcd/timing-audit",
         files=files,
         data=data,
         timeout=TIMEOUT,
@@ -126,6 +156,77 @@ def main() -> int:
           r5.status_code == 422 and err5.get("code") == "WINDOW_NOT_COVERED"
           and "signals" not in r5.json(),
           f"status={r5.status_code} body={r5.text[:200]}")
+
+    # 7. timing audit happy path: one clean edge, one edge with both a
+    #    setup and a hold violation, plus summary counts
+    audit_ns = AUDIT_HEADER.format(ts="1ns") + (
+        "#0\n0!\n0\"\n"
+        "#10\n1!\n"
+        "#13\n1\"\n"
+        "#20\n0!\n"
+        "#25\n0\"\n"
+        "#29\n1\"\n"
+        "#30\n1!\n"
+        "#31\n0\"\n"
+        "#40\n0!\n"
+        "#50\n"
+    )
+    r6 = post_audit(audit_ns, 10_000_000, 40_000_000, setup=2_000_000, hold=2_000_000)
+    ok6 = False
+    if r6.status_code == 200:
+        body6 = r6.json()
+        try:
+            e10, e30 = body6["edges"]
+            ok6 = (
+                [e["time"] for e in body6["edges"]] == [10_000_000, 30_000_000]
+                and e10["signals"]["top.data"] == {
+                    "sampled": "0", "unknown": False, "violations": []}
+                and e30["signals"]["top.data"]["sampled"] == "1"
+                and [v["kind"] for v in e30["signals"]["top.data"]["violations"]]
+                    == ["setup", "hold"]
+                and body6["summary"] == {
+                    "edges": 2, "signals": 1, "checks": 2, "clean": 1,
+                    "setup_violations": 1, "hold_violations": 1, "unknown": 0}
+            )
+        except (KeyError, ValueError):
+            ok6 = False
+    check("timing audit: edges, violations and summary counts",
+          ok6, f"status={r6.status_code} body={r6.text[:300]}")
+
+    # 8. same-instant data transition counts as setup AND hold
+    same_instant = AUDIT_HEADER.format(ts="1ns") + (
+        "#0\n0!\n0\"\n#10\n1!\n#20\n0!\n#30\n1!\n1\"\n#40\n0!\n#50\n"
+    )
+    r7 = post_audit(same_instant, 10_000_000, 40_000_000,
+                    setup=2_000_000, hold=2_000_000)
+    ok7 = False
+    if r7.status_code == 200:
+        try:
+            v7 = r7.json()["edges"][1]["signals"]["top.data"]["violations"]
+            ok7 = ([v["kind"] for v in v7] == ["setup", "hold"]
+                   and all(v["time"] == 30_000_000 for v in v7))
+        except (KeyError, IndexError):
+            ok7 = False
+    check("timing audit: same-instant transition is setup and hold",
+          ok7, f"status={r7.status_code} body={r7.text[:300]}")
+
+    # 9. cross-timescale audit: the 1ps twin of check 7 must agree in fs
+    audit_ps = AUDIT_HEADER.format(ts="1ps") + (
+        "#0\n0!\n0\"\n"
+        "#10000\n1!\n"
+        "#13000\n1\"\n"
+        "#20000\n0!\n"
+        "#25000\n0\"\n"
+        "#29000\n1\"\n"
+        "#30000\n1!\n"
+        "#31000\n0\"\n"
+        "#40000\n0!\n"
+        "#50000\n"
+    )
+    r8 = post_audit(audit_ps, 10_000_000, 40_000_000, setup=2_000_000, hold=2_000_000)
+    check("timing audit: cross-timescale audits agree in femtoseconds",
+          r6.status_code == r8.status_code == 200 and r8.json() == r6.json(),
+          f"status={r8.status_code} body={r8.text[:300]}")
 
     if failures:
         print(f"\n{len(failures)} smoke check(s) failed: {failures}")
